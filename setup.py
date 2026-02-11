@@ -97,17 +97,17 @@ if not SKIP_CUDA_BUILD:
                 "Note: make sure nvcc has a supported version by running nvcc -V."
             )
     
-    # 支持多种常见的GPU架构
-    # 70: V100, 75: T4/RTX, 80: A100, 86: RTX 3090/RTX A6000, 89: RTX 4090, 90: H100
+    # Auto-detect supported GPU archs based on CUDA toolkit version
+    # 80: A100 (Ampere), 90: H100 (Hopper, CUDA 11.8+), 120: B100/B200 (Blackwell, CUDA 12.8+)
     supported_archs = ["80"]
+    if CUDA_HOME is not None:
+        if bare_metal_version >= Version("11.8"):
+            supported_archs.append("90")
+        if bare_metal_version >= Version("12.8"):
+            supported_archs.append("120")
 
     for arch in supported_archs:
         cc_flag.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
-    
-    if CUDA_HOME is not None:
-        if bare_metal_version >= Version("11.8"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
