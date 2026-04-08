@@ -46,7 +46,7 @@ def test_pooling_shapes_cpu():
         cu_k,
         cache_lens,
         max_seqlen_q=4,
-        max_seqlen_k=10,
+        max_context_len=10,
         local_blocks=1,
         init_blocks=1,
         block_size=4,

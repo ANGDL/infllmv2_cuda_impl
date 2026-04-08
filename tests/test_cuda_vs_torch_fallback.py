@@ -131,7 +131,7 @@ def test_pooling_cuda_vs_torch_accuracy_and_perf():
         cu_k,
         cache_lens,
         max_seqlen_q=260,
-        max_seqlen_k=1024,
+        max_context_len=1024,
         local_blocks=2,
         init_blocks=1,
         block_size=64,

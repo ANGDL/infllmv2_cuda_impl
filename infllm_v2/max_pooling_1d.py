@@ -105,7 +105,7 @@ def max_pooling_1d_varlen(
             cu_seqlens_k,
             cache_lens,
             max_seqlen_q,
-            max_seqlen_k,
+            input.shape[2],
             local_blocks,
             init_blocks,
             block_size=block_size,
