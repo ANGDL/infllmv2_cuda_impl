@@ -1,0 +1,184 @@
+import time
+
+import pytest
+import torch
+
+from infllm_v2 import (
+    blockmask_to_uint64,
+    get_probs,
+    max_pooling_1d,
+    max_pooling_1d_varlen,
+    topk,
+    topk_to_uint64,
+    uint64_to_bool,
+)
+from infllm_v2._cuda_ext import C
+from infllm_v2.torch_kernels import (
+    blockmask_to_uint64_torch,
+    max_pooling_1d_torch,
+    max_pooling_1d_varlen_torch,
+    topk_to_uint64_torch,
+    uint64_to_bool_torch,
+)
+
+
+def _bench_cuda(fn, warmup=5, iters=30):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    st = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - st) / iters
+
+
+pytestmark = pytest.mark.skipif(
+    (not torch.cuda.is_available()) or (C is None),
+    reason="requires CUDA and compiled infllm_v2.C extension",
+)
+
+
+def test_mask_pack_unpack_cuda_vs_torch_accuracy_and_perf():
+    device = "cuda"
+    mask = torch.randint(0, 2, (8, 16, 513), device=device, dtype=torch.bool)
+
+    packed_cuda, last_dim = blockmask_to_uint64(mask)
+    packed_torch, _ = blockmask_to_uint64_torch(mask)
+    assert torch.equal(packed_cuda, packed_torch)
+
+    rec_cuda = uint64_to_bool(packed_cuda, last_dim)
+    rec_torch = uint64_to_bool_torch(packed_cuda, last_dim)
+    assert torch.equal(rec_cuda, rec_torch)
+    assert torch.equal(rec_cuda, mask)
+
+    t_cuda_pack = _bench_cuda(lambda: blockmask_to_uint64(mask)[0])
+    t_torch_pack = _bench_cuda(lambda: blockmask_to_uint64_torch(mask)[0])
+    t_cuda_unpack = _bench_cuda(lambda: uint64_to_bool(packed_cuda, last_dim))
+    t_torch_unpack = _bench_cuda(lambda: uint64_to_bool_torch(packed_cuda, last_dim))
+
+    print(
+        f"\npack cuda={t_cuda_pack*1e3:.3f}ms torch={t_torch_pack*1e3:.3f}ms | "
+        f"unpack cuda={t_cuda_unpack*1e3:.3f}ms torch={t_torch_unpack*1e3:.3f}ms"
+    )
+
+
+def test_topk_to_uint64_cuda_vs_torch_accuracy_and_perf():
+    device = "cuda"
+    topk_idx = torch.randint(-1, 64, (4, 8, 256, 32), device=device, dtype=torch.int32)
+
+    out_cuda, k_blocks_cuda = topk_to_uint64(topk_idx, max_seqlen_k=4096, block_size=64)
+    out_torch, k_blocks_torch = topk_to_uint64_torch(topk_idx, max_seqlen_k=4096, block_size=64)
+    assert k_blocks_cuda == k_blocks_torch
+    assert torch.equal(out_cuda, out_torch)
+
+    t_cuda = _bench_cuda(lambda: topk_to_uint64(topk_idx, max_seqlen_k=4096, block_size=64)[0])
+    t_torch = _bench_cuda(lambda: topk_to_uint64_torch(topk_idx, max_seqlen_k=4096, block_size=64)[0])
+    print(f"\ntopk_to_uint64 cuda={t_cuda*1e3:.3f}ms torch={t_torch*1e3:.3f}ms")
+
+
+def test_topk_cuda_vs_torch_accuracy_and_perf():
+    device = "cuda"
+    x = torch.randn(256, 512, device=device, dtype=torch.float16)
+
+    v_cuda, i_cuda = topk(x, top=16)
+    v_ref, i_ref = torch.topk(x, k=16, dim=-1, largest=True, sorted=True)
+    assert torch.allclose(v_cuda, v_ref, atol=1e-3, rtol=1e-3)
+    assert torch.equal(i_cuda.to(torch.int64), i_ref)
+
+    t_cuda = _bench_cuda(lambda: topk(x, top=16)[0])
+    t_torch = _bench_cuda(lambda: torch.topk(x, k=16, dim=-1, largest=True, sorted=True)[0])
+    print(f"\ntopk cuda={t_cuda*1e3:.3f}ms torch={t_torch*1e3:.3f}ms")
+
+
+def test_get_probs_cuda_vs_torch_accuracy_and_perf():
+    device = "cuda"
+    attn = torch.randn(512, 128, device=device, dtype=torch.float16)
+    lse = torch.randn(512, device=device, dtype=torch.float32)
+    scale = 0.125
+
+    out_cuda = get_probs(attn, lse, scale=scale, inplace=False)
+    out_torch = torch.exp(attn * scale - lse[:, None].to(attn.dtype))
+    assert torch.allclose(out_cuda, out_torch, atol=2e-3, rtol=2e-3)
+
+    t_cuda = _bench_cuda(lambda: get_probs(attn, lse, scale=scale, inplace=False))
+    t_torch = _bench_cuda(lambda: torch.exp(attn * scale - lse[:, None].to(attn.dtype)))
+    print(f"\nget_probs cuda={t_cuda*1e3:.3f}ms torch={t_torch*1e3:.3f}ms")
+
+
+def test_pooling_cuda_vs_torch_accuracy_and_perf():
+    device = "cuda"
+
+    x = torch.randn(8, 512, 1024, device=device, dtype=torch.float16)
+    out_cuda = max_pooling_1d(x, cache_len=0, local_blocks=2, init_blocks=1, block_size=64, stride=16)
+    out_torch = max_pooling_1d_torch(x, cache_len=0, local_blocks=2, init_blocks=1, block_size=64, stride=16)
+    assert torch.equal(torch.isinf(out_cuda), torch.isinf(out_torch))
+    finite = torch.isfinite(out_cuda) & torch.isfinite(out_torch)
+    assert torch.allclose(out_cuda[finite], out_torch[finite], atol=1e-3, rtol=1e-3)
+
+    t_cuda = _bench_cuda(lambda: max_pooling_1d(x, cache_len=0, local_blocks=2, init_blocks=1, block_size=64, stride=16))
+    t_torch = _bench_cuda(lambda: max_pooling_1d_torch(x, cache_len=0, local_blocks=2, init_blocks=1, block_size=64, stride=16))
+    print(f"\nmax_pooling_1d cuda={t_cuda*1e3:.3f}ms torch={t_torch*1e3:.3f}ms")
+
+    xv = torch.randn(4, 900, 1024, device=device, dtype=torch.float16)
+    cu_q = torch.tensor([0, 200, 420, 640, 900], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, 256, 512, 768, 1024], device=device, dtype=torch.int32)
+    cache_lens = torch.tensor([0, 16, 32, 48], device=device, dtype=torch.int32)
+
+    outv_cuda = max_pooling_1d_varlen(
+        xv,
+        cu_q,
+        cu_k,
+        cache_lens,
+        max_seqlen_q=260,
+        max_seqlen_k=1024,
+        local_blocks=2,
+        init_blocks=1,
+        block_size=64,
+        stride=16,
+    )
+    outv_torch = max_pooling_1d_varlen_torch(
+        xv,
+        cu_q,
+        cu_k,
+        cache_lens,
+        max_seqlen_q=260,
+        max_seqlen_k=1024,
+        local_blocks=2,
+        init_blocks=1,
+        block_size=64,
+        stride=16,
+    )
+    assert torch.equal(torch.isinf(outv_cuda), torch.isinf(outv_torch))
+    finite_v = torch.isfinite(outv_cuda) & torch.isfinite(outv_torch)
+    assert torch.allclose(outv_cuda[finite_v], outv_torch[finite_v], atol=1e-3, rtol=1e-3)
+
+    t_cuda_v = _bench_cuda(
+        lambda: max_pooling_1d_varlen(
+            xv,
+            cu_q,
+            cu_k,
+            cache_lens,
+            max_seqlen_q=260,
+            max_seqlen_k=1024,
+            local_blocks=2,
+            init_blocks=1,
+            block_size=64,
+            stride=16,
+        )
+    )
+    t_torch_v = _bench_cuda(
+        lambda: max_pooling_1d_varlen_torch(
+            xv,
+            cu_q,
+            cu_k,
+            cache_lens,
+            max_seqlen_q=260,
+            max_seqlen_k=1024,
+            local_blocks=2,
+            init_blocks=1,
+            block_size=64,
+            stride=16,
+        )
+    )
+    print(f"\nmax_pooling_1d_varlen cuda={t_cuda_v*1e3:.3f}ms torch={t_torch_v*1e3:.3f}ms")
