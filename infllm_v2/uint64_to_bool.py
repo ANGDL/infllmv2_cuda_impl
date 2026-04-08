@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple
-from . import C
+from ._cuda_ext import C
+from .torch_kernels import uint64_to_bool_torch
 
 def uint64_to_bool(uint64_array: torch.Tensor, last_dim_size: int) -> torch.Tensor:
     """
@@ -13,6 +14,9 @@ def uint64_to_bool(uint64_array: torch.Tensor, last_dim_size: int) -> torch.Tens
     Returns:
         Boolean tensor with the same batch dimensions and last dimension of size last_dim_size
     """
+    if C is None or not uint64_array.is_cuda:
+        return uint64_to_bool_torch(uint64_array, last_dim_size)
+
     # Record original shape of uint64 array
     original_shape = uint64_array.shape
     n_uint64_per_row = original_shape[-1]

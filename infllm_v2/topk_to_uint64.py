@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple, Optional
-from . import C
+from ._cuda_ext import C
+from .torch_kernels import topk_to_uint64_torch
 
 def topk_to_uint64(topk_idx: torch.Tensor, max_seqlen_k: int, block_size: int, 
                    memory_buffer: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, int]:
@@ -21,6 +22,9 @@ def topk_to_uint64(topk_idx: torch.Tensor, max_seqlen_k: int, block_size: int,
             k_blocks: Number of key blocks
     """
     assert topk_idx.dtype == torch.int32
+    if C is None or not topk_idx.is_cuda:
+        return topk_to_uint64_torch(topk_idx, max_seqlen_k, block_size)
+
     # Calculate key blocks
     k_blocks = (max_seqlen_k + block_size - 1) // block_size  # Ceiling division
     
@@ -66,40 +70,4 @@ def topk_to_uint64(topk_idx: torch.Tensor, max_seqlen_k: int, block_size: int,
             n_uint64_per_row
         )
     
-    # Log device information before return
-    #print(f"topk_to_uint64 - input device: {topk_idx.device}, output device: {result.device}")
-    
     return result, k_blocks
-
-
-    """
-    A class that manages memory buffer for topk_to_uint64 conversions.
-    This can improve performance by reusing memory across multiple calls.
-    """
-    
-    def __init__(self):
-        self.memory_buffer = None
-    
-    def convert(self, topk_idx: torch.Tensor, max_seqlen_k: int, block_size: int) -> Tuple[torch.Tensor, int]:
-        """
-        Convert topk indices to uint64 representation, reusing memory buffer when possible.
-        
-        Args:
-            topk_idx: Tensor of shape [batch, num_heads, total_seqlen, k] or [num_heads, total_seqlen, k]
-                     containing block indices
-            max_seqlen_k: Maximum sequence length for keys
-            block_size: Size of each block
-            
-        Returns:
-            Tuple of:
-                uint64_arrays: Tensor with the same batch dimensions but last dim replaced with uint64 values
-                k_blocks: Number of key blocks
-        """
-        result, k_blocks = topk_to_uint64(topk_idx, max_seqlen_k, block_size, self.memory_buffer)
-        # Update our memory buffer reference for next time
-        self.memory_buffer = result
-        return result, k_blocks
-    
-    def clear_memory(self):
-        """Clear the internal memory buffer"""
-        self.memory_buffer = None 

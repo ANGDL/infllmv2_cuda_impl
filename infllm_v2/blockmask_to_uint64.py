@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple
-from . import C
+from ._cuda_ext import C
+from .torch_kernels import blockmask_to_uint64_torch
 
 def blockmask_to_uint64(blockmask: torch.Tensor) -> Tuple[torch.Tensor, int]:
     """
@@ -14,6 +15,9 @@ def blockmask_to_uint64(blockmask: torch.Tensor) -> Tuple[torch.Tensor, int]:
             uint64_arrays: Tensor with the same batch dimensions but last dim replaced with uint64 values
             last_dim_size: Original size of the last dimension
     """
+    if C is None or not blockmask.is_cuda:
+        return blockmask_to_uint64_torch(blockmask)
+
     # Record original shape
     original_shape = blockmask.shape
     last_dim_size = original_shape[-1]

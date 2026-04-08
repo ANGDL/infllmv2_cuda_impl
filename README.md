@@ -92,6 +92,64 @@ pip install -e .
 
 The InfLLM V2 CUDA kernel provides the following interfaces for the two-stage sparse attention:
 
+### Utility Kernel APIs (with automatic PyTorch fallback)
+
+The following utility APIs use CUDA kernels when the extension is available on CUDA tensors, and automatically fall back to PyTorch implementations otherwise.
+
+```python
+import torch
+from infllm_v2 import (
+  topk,
+  get_probs,
+  blockmask_to_uint64,
+  uint64_to_bool,
+  topk_to_uint64,
+  max_pooling_1d,
+  max_pooling_1d_varlen,
+)
+
+# 1) topk on the last dimension
+x = torch.randn(4, 128, device="cuda", dtype=torch.float16)
+vals, idx = topk(x, top=8)
+
+# 2) get_probs: exp(attn_probs * scale - lse)
+attn_probs = torch.randn(4, 128, device="cuda", dtype=torch.float16)
+lse = torch.randn(4, device="cuda", dtype=torch.float32)
+probs = get_probs(attn_probs, lse, scale=0.125, inplace=False)
+
+# 3) bool mask <-> uint64 packing
+mask = torch.randint(0, 2, (2, 16, 97), device="cuda", dtype=torch.bool)
+packed, last_dim = blockmask_to_uint64(mask)
+mask_recovered = uint64_to_bool(packed, last_dim)
+
+# 4) topk indices -> uint64 bitmask
+topk_idx = torch.randint(-1, 8, (2, 16, 32), device="cuda", dtype=torch.int32)
+packed_from_idx, k_blocks = topk_to_uint64(topk_idx, max_seqlen_k=512, block_size=64)
+
+# 5) fixed-length pooling
+scores = torch.randn(2, 256, 512, device="cuda", dtype=torch.float16)
+pooled = max_pooling_1d(scores, cache_len=0, local_blocks=2, init_blocks=1)
+
+# 6) varlen pooling
+cu_q = torch.tensor([0, 100, 256], device="cuda", dtype=torch.int32)
+cu_k = torch.tensor([0, 320, 512], device="cuda", dtype=torch.int32)
+cache_lens = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
+pooled_varlen = max_pooling_1d_varlen(
+  scores,
+  cu_q,
+  cu_k,
+  cache_lens,
+  max_seqlen_q=156,
+  max_seqlen_k=512,
+  local_blocks=2,
+  init_blocks=1,
+)
+```
+
+Notes:
+- CPU tensors always use the PyTorch fallback path.
+- CUDA tensors use the CUDA extension path when available; otherwise they also fall back to PyTorch.
+
 #### Stage 1: Attention Score Computation and Aggregation (feature_infer branch)
 
 ```python

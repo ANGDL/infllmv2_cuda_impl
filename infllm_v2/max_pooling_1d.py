@@ -1,7 +1,6 @@
 import torch
-
-import warnings
-from . import C
+from ._cuda_ext import C
+from .torch_kernels import max_pooling_1d_torch, max_pooling_1d_varlen_torch
 
 def max_pooling_1d(
     input: torch.Tensor, # num_heads x q_len x k_len
@@ -12,6 +11,16 @@ def max_pooling_1d(
     stride: int = 16,
 ) -> torch.Tensor:
     assert input.dtype == torch.float16 or input.dtype == torch.bfloat16
+    if C is None or not input.is_cuda:
+        return max_pooling_1d_torch(
+            input,
+            cache_len=cache_len,
+            local_blocks=local_blocks,
+            init_blocks=init_blocks,
+            block_size=block_size,
+            stride=stride,
+        )
+
     input = input.contiguous()
     stride = block_size // stride
     kernel_size = stride + 1
@@ -85,6 +94,23 @@ def max_pooling_1d_varlen(
     assert cu_seqlens_k.dtype == torch.int32
     assert cache_lens.dtype == torch.int32
     assert input.dim() == 3, f"Expected 3D input, got {input.dim()}D"
+
+    # Keep the same max_seqlen_k derivation as CUDA path in this branch.
+    max_seqlen_k = max_context_len // stride
+
+    if C is None or not input.is_cuda:
+        return max_pooling_1d_varlen_torch(
+            input,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cache_lens,
+            max_seqlen_q,
+            max_seqlen_k,
+            local_blocks,
+            init_blocks,
+            block_size=block_size,
+            stride=stride,
+        )
     
     input = input.contiguous()
     cu_seqlens_q = cu_seqlens_q.contiguous()
@@ -94,7 +120,6 @@ def max_pooling_1d_varlen(
     # TODO: Based on the passed parameters in hf code, 
     # the stride passed in should be the stride used during compress k1. 
     # This differs from the kernel comment and requires subsequent verification.
-    max_seqlen_k = max_context_len // stride
     out_len = (max_context_len + block_size - 1) // block_size
     
     stride = block_size // stride
