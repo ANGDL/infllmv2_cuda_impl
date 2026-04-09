@@ -151,8 +151,10 @@ def max_pooling_1d_varlen_torch(
     stride_inner = block_size // stride
     kernel_size = stride_inner + 1
     padding = 1
-    max_cache_len = int(cache_lens.max().item()) if cache_lens.numel() > 0 else 0
-    out_len = (max_seqlen_q + max_cache_len + block_size - 1) // block_size
+    # Keep current branch behavior: varlen wrapper computes out_len from
+    # max_context_len-like argument (passed in as max_seqlen_k here), not
+    # from max_seqlen_q + max_cache_len.
+    out_len = (max_seqlen_k + block_size - 1) // block_size
 
     output = torch.zeros(num_heads, total_q, out_len, device=input.device, dtype=input.dtype)
     pos_inf = torch.tensor(float("inf"), device=input.device, dtype=input.dtype)

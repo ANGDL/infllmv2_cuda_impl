@@ -52,7 +52,7 @@ def test_pooling_shapes_cpu():
         block_size=4,
         stride=2,
     )
-    assert yv.shape == (2, 6, 2)
+    assert yv.shape == (2, 6, 3)
 
 
 def test_topk_fallback_cpu_matches_torch_topk():
