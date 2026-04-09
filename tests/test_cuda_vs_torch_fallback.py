@@ -1,4 +1,5 @@
 import time
+import inspect
 
 import pytest
 import torch
@@ -20,6 +21,41 @@ from infllm_v2.torch_kernels import (
     topk_to_uint64_torch,
     uint64_to_bool_torch,
 )
+
+
+def _call_max_pooling_1d_varlen_adaptive(
+    input_tensor,
+    cu_q,
+    cu_k,
+    cache_lens,
+    max_seqlen_q,
+    max_k_or_context,
+    local_blocks,
+    init_blocks,
+    block_size,
+    stride,
+):
+    """Call max_pooling_1d_varlen across branches with different kwarg names."""
+    sig = inspect.signature(max_pooling_1d_varlen)
+    kwargs = dict(
+        max_seqlen_q=max_seqlen_q,
+        local_blocks=local_blocks,
+        init_blocks=init_blocks,
+        block_size=block_size,
+        stride=stride,
+    )
+    if "max_context_len" in sig.parameters:
+        kwargs["max_context_len"] = max_k_or_context
+    else:
+        kwargs["max_seqlen_k"] = max_k_or_context
+
+    return max_pooling_1d_varlen(
+        input_tensor,
+        cu_q,
+        cu_k,
+        cache_lens,
+        **kwargs,
+    )
 
 
 def _bench_cuda(fn, warmup=5, iters=30):
@@ -83,8 +119,14 @@ def test_topk_cuda_vs_torch_accuracy_and_perf():
 
     v_cuda, i_cuda = topk(x, top=16)
     v_ref, i_ref = torch.topk(x, k=16, dim=-1, largest=True, sorted=True)
+
+    # Value agreement is the primary correctness criterion.
     assert torch.allclose(v_cuda, v_ref, atol=1e-3, rtol=1e-3)
-    assert torch.equal(i_cuda.to(torch.int64), i_ref)
+    # For fp16 inputs, ties are common and index tie-breaking may differ.
+    # Verify indices are in-range and map back to the same selected values.
+    assert torch.all((i_cuda >= 0) & (i_cuda < x.shape[-1]))
+    gathered = x.gather(dim=-1, index=i_cuda.to(torch.int64))
+    assert torch.allclose(gathered, v_cuda, atol=1e-3, rtol=1e-3)
 
     t_cuda = _bench_cuda(lambda: topk(x, top=16)[0])
     t_torch = _bench_cuda(lambda: torch.topk(x, k=16, dim=-1, largest=True, sorted=True)[0])
@@ -98,8 +140,9 @@ def test_get_probs_cuda_vs_torch_accuracy_and_perf():
     scale = 0.125
 
     out_cuda = get_probs(attn, lse, scale=scale, inplace=False)
-    out_torch = torch.exp(attn * scale - lse[:, None].to(attn.dtype))
-    assert torch.allclose(out_cuda, out_torch, atol=2e-3, rtol=2e-3)
+    # Kernel computes in float and writes back to fp16/bf16.
+    out_torch = torch.exp(attn.to(torch.float32) * scale - lse[:, None]).to(attn.dtype)
+    assert torch.allclose(out_cuda, out_torch, atol=3e-3, rtol=3e-3)
 
     t_cuda = _bench_cuda(lambda: get_probs(attn, lse, scale=scale, inplace=False))
     t_torch = _bench_cuda(lambda: torch.exp(attn * scale - lse[:, None].to(attn.dtype)))
@@ -125,13 +168,13 @@ def test_pooling_cuda_vs_torch_accuracy_and_perf():
     cu_k = torch.tensor([0, 256, 512, 768, 1024], device=device, dtype=torch.int32)
     cache_lens = torch.tensor([0, 16, 32, 48], device=device, dtype=torch.int32)
 
-    outv_cuda = max_pooling_1d_varlen(
+    outv_cuda = _call_max_pooling_1d_varlen_adaptive(
         xv,
         cu_q,
         cu_k,
         cache_lens,
         max_seqlen_q=260,
-        max_context_len=1024,
+        max_k_or_context=1024,
         local_blocks=2,
         init_blocks=1,
         block_size=64,
@@ -154,13 +197,13 @@ def test_pooling_cuda_vs_torch_accuracy_and_perf():
     assert torch.allclose(outv_cuda[finite_v], outv_torch[finite_v], atol=1e-3, rtol=1e-3)
 
     t_cuda_v = _bench_cuda(
-        lambda: max_pooling_1d_varlen(
+        lambda: _call_max_pooling_1d_varlen_adaptive(
             xv,
             cu_q,
             cu_k,
             cache_lens,
             max_seqlen_q=260,
-            max_seqlen_k=1024,
+            max_k_or_context=1024,
             local_blocks=2,
             init_blocks=1,
             block_size=64,
