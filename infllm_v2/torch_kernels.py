@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -128,6 +128,7 @@ def max_pooling_1d_varlen_torch(
     init_blocks: int,
     block_size: int = 64,
     stride: int = 16,
+    max_context_len: Optional[int] = None,
 ) -> torch.Tensor:
     if input.dtype not in (torch.float16, torch.bfloat16):
         raise AssertionError("input must be float16 or bfloat16")
@@ -143,18 +144,30 @@ def max_pooling_1d_varlen_torch(
 
     if cu_seqlens_q[-1].item() != total_q:
         raise AssertionError("total_q mismatch with cu_seqlens_q")
-    if input.shape[2] != max_seqlen_k:
-        raise AssertionError("max_k mismatch")
     if cache_lens.shape[0] != batch_size:
         raise AssertionError("cache_lens batch size mismatch")
 
     stride_inner = block_size // stride
     kernel_size = stride_inner + 1
     padding = 1
-    # Keep current branch behavior: varlen wrapper computes out_len from
-    # max_context_len-like argument (passed in as max_seqlen_k here), not
-    # from max_seqlen_q + max_cache_len.
-    out_len = (max_seqlen_k + block_size - 1) // block_size
+
+    # Support both semantics:
+    # 1) legacy/reference path: out_len derived from max_seqlen_k
+    # 2) current branch CUDA path: out_len derived from max_context_len,
+    #    while max_seqlen_k is compressed K dimension (max_context_len // stride).
+    if max_context_len is None:
+        if input.shape[2] != max_seqlen_k:
+            raise AssertionError("max_k mismatch")
+        out_len_base = max_seqlen_k
+    else:
+        expected_compressed_k = max_context_len // stride
+        if max_seqlen_k != expected_compressed_k:
+            raise AssertionError("max_seqlen_k does not match max_context_len // stride")
+        if input.shape[2] not in (max_seqlen_k, max_context_len):
+            raise AssertionError("max_k mismatch")
+        out_len_base = max_context_len
+
+    out_len = (out_len_base + block_size - 1) // block_size
 
     output = torch.zeros(num_heads, total_q, out_len, device=input.device, dtype=input.dtype)
     pos_inf = torch.tensor(float("inf"), device=input.device, dtype=input.dtype)

@@ -59,6 +59,14 @@ def _call_max_pooling_1d_varlen_adaptive(
     )
 
 
+def _resolve_varlen_torch_ref_max_seqlen_k(max_k_or_context, stride):
+    """Match torch reference semantics to the active max_pooling_1d_varlen wrapper."""
+    sig = inspect.signature(max_pooling_1d_varlen)
+    if "max_context_len" in sig.parameters:
+        return max_k_or_context // stride
+    return max_k_or_context
+
+
 def _bench_cuda(fn, warmup=5, iters=30):
     for _ in range(warmup):
         fn()
@@ -169,9 +177,11 @@ def test_max_pooling_1d_cuda_vs_torch_accuracy_and_perf():
 def test_max_pooling_1d_varlen_cuda_vs_torch_accuracy_and_perf():
     device = "cuda"
 
-    xv = torch.randn(4, 900, 1024, device=device, dtype=torch.float16)
+    # In this branch, max_pooling_1d_varlen derives max_seqlen_k as
+    # max_context_len // stride, so use compressed-k shaped inputs here.
+    xv = torch.randn(4, 900, 64, device=device, dtype=torch.float16)
     cu_q = torch.tensor([0, 200, 420, 640, 900], device=device, dtype=torch.int32)
-    cu_k = torch.tensor([0, 256, 512, 768, 1024], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, 16, 32, 48, 64], device=device, dtype=torch.int32)
     cache_lens = torch.tensor([0, 16, 32, 48], device=device, dtype=torch.int32)
 
     try:
@@ -192,17 +202,20 @@ def test_max_pooling_1d_varlen_cuda_vs_torch_accuracy_and_perf():
             pytest.skip("max_pooling_1d_varlen ABI mismatch for current compiled extension")
         raise
 
+    ref_max_seqlen_k = _resolve_varlen_torch_ref_max_seqlen_k(max_k_or_context=1024, stride=16)
+
     outv_torch = max_pooling_1d_varlen_torch(
         xv,
         cu_q,
         cu_k,
         cache_lens,
         max_seqlen_q=260,
-        max_seqlen_k=1024,
+        max_seqlen_k=ref_max_seqlen_k,
         local_blocks=2,
         init_blocks=1,
         block_size=64,
         stride=16,
+        max_context_len=1024,
     )
     assert torch.equal(torch.isinf(outv_cuda), torch.isinf(outv_torch))
     finite_v = torch.isfinite(outv_cuda) & torch.isfinite(outv_torch)
@@ -227,11 +240,12 @@ def test_max_pooling_1d_varlen_cuda_vs_torch_accuracy_and_perf():
             cu_k,
             cache_lens,
             max_seqlen_q=260,
-            max_seqlen_k=1024,
+            max_seqlen_k=ref_max_seqlen_k,
             local_blocks=2,
             init_blocks=1,
             block_size=64,
             stride=16,
+            max_context_len=1024,
         )
     )
     print(f"\nmax_pooling_1d_varlen cuda={t_cuda_v*1e3:.3f}ms torch={t_torch_v*1e3:.3f}ms")

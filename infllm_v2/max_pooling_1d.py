@@ -104,12 +104,13 @@ def max_pooling_1d_varlen(
             cu_seqlens_q,
             cu_seqlens_k,
             cache_lens,
-            max_seqlen_q,
-            input.shape[2],
-            local_blocks,
-            init_blocks,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            local_blocks=local_blocks,
+            init_blocks=init_blocks,
             block_size=block_size,
             stride=stride,
+            max_context_len=max_context_len,
         )
     
     input = input.contiguous()
