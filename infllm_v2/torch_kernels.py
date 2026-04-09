@@ -60,28 +60,25 @@ def topk_to_uint64_torch(topk_idx: torch.Tensor, max_seqlen_k: int, block_size: 
         raise AssertionError("topk_idx must be 3D or 4D")
 
     bool_mask = torch.zeros(flat.shape[0], k_blocks, dtype=torch.bool, device=flat.device)
-    for col in range(flat.shape[1]):
-        curr = flat[:, col]
-        valid = (curr >= 0) & (curr < k_blocks)
-        if valid.any():
-            rows = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-            bool_mask[rows, curr[rows].to(torch.long)] = True
+    valid = (flat >= 0) & (flat < k_blocks)
+    if valid.any():
+        safe_idx = flat.clamp(0, k_blocks - 1).to(torch.long)
+        row_idx = torch.arange(flat.shape[0], device=flat.device, dtype=torch.long)[:, None].expand_as(safe_idx)
+        bool_mask[row_idx[valid], safe_idx[valid]] = True
 
     packed, _ = blockmask_to_uint64_torch(bool_mask)
     return packed.reshape(out_shape), k_blocks
 
 
 def _pool_windows(input_tensor: torch.Tensor, out_len: int, k_len: int, kernel_size: int, stride: int, padding: int) -> torch.Tensor:
-    if k_len == 0:
-        return torch.full((*input_tensor.shape[:-1], out_len), -float("inf"), dtype=input_tensor.dtype, device=input_tensor.device)
-
     base = torch.arange(out_len, device=input_tensor.device, dtype=torch.long)[:, None] * stride - padding
     offs = torch.arange(kernel_size, device=input_tensor.device, dtype=torch.long)[None, :]
     idx = base + offs
     valid = (idx >= 0) & (idx < k_len)
-    safe_idx = idx.clamp(0, k_len - 1)
+    safe_idx = idx.clamp(0, max(k_len - 1, 0))
 
-    gathered = input_tensor[:, :, safe_idx]
+    source = input_tensor[:, :, :max(k_len, 1)]
+    gathered = source[:, :, safe_idx]
     neg_inf = torch.tensor(-float("inf"), device=input_tensor.device, dtype=input_tensor.dtype)
     gathered = torch.where(valid[None, None, :, :], gathered, neg_inf)
     return gathered.max(dim=-1).values
