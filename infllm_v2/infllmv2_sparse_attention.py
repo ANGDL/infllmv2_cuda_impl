@@ -7,7 +7,7 @@ import torch.nn as nn
 import os
 
 # Import from infllm_v2's C extension and local modules
-from . import C as infllm_cuda
+from ._cuda_ext import C as infllm_cuda
 from .topk_to_uint64 import topk_to_uint64 as cuda_topk_to_uint64
 from .uint64_to_bool import uint64_to_bool as cuda_uint64_to_bool
 from .blockmask_to_uint64 import blockmask_to_uint64 as cuda_blockmask_to_uint64
@@ -20,6 +20,177 @@ def maybe_contiguous(x):
 
 def round_multiple(x, m):
     return (x + m - 1) // m * m
+
+
+def _repeat_kv_heads(x: torch.Tensor, nheads_q: int) -> torch.Tensor:
+    nheads_k = x.shape[1]
+    if nheads_q % nheads_k != 0:
+        raise ValueError("nheads_q must be divisible by nheads_k for GQA/MQA")
+    if nheads_q == nheads_k:
+        return x
+    return x.repeat_interleave(nheads_q // nheads_k, dim=1)
+
+
+def _varlen_causal_mask(q_len: int, k_len: int, device: torch.device) -> torch.Tensor:
+    q_idx = torch.arange(q_len, device=device)[:, None]
+    k_idx = torch.arange(k_len, device=device)[None, :]
+    # Bottom-right aligned causal mask used by flash-attn varlen.
+    return k_idx > (q_idx + k_len - q_len)
+
+
+def _nsa_stage1_causal_mask(q_len: int, k_len: int, device: torch.device) -> torch.Tensor:
+    # Keep behavior consistent with existing stage1 reference in tests/stage1/naive_softmax.py.
+    q_idx = torch.arange(q_len, device=device)
+    right = ((q_idx - 15) // 16) + k_len - (q_len - 16 + 1) // 16
+    right = right.clamp(0, k_len)
+    k_idx = torch.arange(k_len, device=device)[None, :]
+    return k_idx >= right[:, None]
+
+
+def _infllmv2_attn_varlen_forward_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    return_softmax: bool = False,
+    block_table: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    topk_idx: Optional[torch.Tensor] = None,
+):
+    if dropout_p != 0.0:
+        raise NotImplementedError("PyTorch fallback currently supports dropout_p=0 only")
+    if block_table is not None or leftpad_k is not None or seqused_k is not None:
+        raise NotImplementedError("PyTorch fallback does not support paged or leftpad/seqused inputs")
+    if topk_idx is not None:
+        raise NotImplementedError("PyTorch fallback does not support topk_idx sparse mask yet")
+    if alibi_slopes is not None:
+        raise NotImplementedError("PyTorch fallback does not support alibi_slopes yet")
+
+    q = maybe_contiguous(q)
+    k = maybe_contiguous(k)
+    v = maybe_contiguous(v)
+
+    total_q, nheads_q, dim = q.shape
+    total_k, nheads_k, _ = k.shape
+    if cu_seqlens_q[-1].item() != total_q or cu_seqlens_k[-1].item() != total_k:
+        raise ValueError("cu_seqlens do not match input lengths")
+
+    k_full = _repeat_kv_heads(k, nheads_q)
+    v_full = _repeat_kv_heads(v, nheads_q)
+
+    out = torch.zeros_like(q)
+    softmax_lse = torch.full((nheads_q, total_q), -float("inf"), dtype=torch.float32, device=q.device)
+    s_dmask = None
+    if return_softmax:
+        s_dmask = torch.full(
+            (nheads_q, total_q, max_seqlen_k),
+            -float("inf"),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+    batch = cu_seqlens_q.numel() - 1
+    for b in range(batch):
+        q_start = int(cu_seqlens_q[b].item())
+        q_end = int(cu_seqlens_q[b + 1].item())
+        k_start = int(cu_seqlens_k[b].item())
+        k_end = int(cu_seqlens_k[b + 1].item())
+
+        q_len = q_end - q_start
+        k_len = k_end - k_start
+        if q_len == 0 or k_len == 0:
+            continue
+
+        q_b = q[q_start:q_end].transpose(0, 1)          # [h, q, d]
+        k_b = k_full[k_start:k_end].transpose(0, 1)     # [h, k, d]
+        v_b = v_full[k_start:k_end].transpose(0, 1)     # [h, k, d]
+
+        scores = torch.matmul(q_b, k_b.transpose(-2, -1)) * softmax_scale
+        if softcap > 0.0:
+            scores = softcap * torch.tanh(scores / softcap)
+
+        mask = torch.zeros((q_len, k_len), dtype=torch.bool, device=q.device)
+        if causal:
+            mask |= _varlen_causal_mask(q_len, k_len, q.device)
+        if window_size_left >= 0 or window_size_right >= 0:
+            q_idx = torch.arange(q_len, device=q.device)[:, None]
+            k_idx = torch.arange(k_len, device=q.device)[None, :]
+            center = q_idx + k_len - q_len
+            if window_size_left >= 0:
+                mask |= k_idx < (center - window_size_left)
+            if window_size_right >= 0:
+                mask |= k_idx > (center + window_size_right)
+
+        masked_scores = scores.masked_fill(mask[None, :, :], -float("inf"))
+        probs = torch.softmax(masked_scores.float(), dim=-1).to(scores.dtype)
+        probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+
+        out_b = torch.matmul(probs, v_b)
+        out[q_start:q_end] = out_b.transpose(0, 1)
+
+        lse = torch.logsumexp(masked_scores.float(), dim=-1)
+        softmax_lse[:, q_start:q_end] = lse
+        if s_dmask is not None:
+            s_dmask[:, q_start:q_end, :k_len] = probs
+
+    return out, softmax_lse, s_dmask, None, None
+
+
+def _infllmv2_attn_stage1_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    q = maybe_contiguous(q)
+    k = maybe_contiguous(k)
+    total_q, nheads_q, _ = q.shape
+    _, nheads_k, _ = k.shape
+    group_size = nheads_q // nheads_k
+
+    output = torch.zeros((nheads_k, total_q, max_seqlen_k), dtype=q.dtype, device=q.device)
+    batch = cu_seqlens_q.numel() - 1
+
+    for b in range(batch):
+        q_start = int(cu_seqlens_q[b].item())
+        q_end = int(cu_seqlens_q[b + 1].item())
+        k_start = int(cu_seqlens_k[b].item())
+        k_end = int(cu_seqlens_k[b + 1].item())
+
+        q_len = q_end - q_start
+        k_len = k_end - k_start
+        if q_len == 0 or k_len == 0:
+            continue
+
+        q_b = q[q_start:q_end].transpose(0, 1)      # [hq, q, d]
+        k_b = k[k_start:k_end].transpose(0, 1)      # [hk, k, d]
+        k_rep = k_b.repeat_interleave(group_size, dim=0)
+
+        scores = torch.matmul(q_b, k_rep.transpose(-2, -1)) * softmax_scale
+        if causal:
+            mask = _nsa_stage1_causal_mask(q_len, k_len, q.device)
+            scores = scores.masked_fill(mask[None, :, :], -float("inf"))
+
+        probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+        probs = probs.reshape(nheads_k, group_size, q_len, k_len).sum(dim=1)
+        output[:, q_start:q_end, :k_len] = probs
+
+    return output
 
 
 # torch.compile() support is only enabled for pytorch >= 2.4
@@ -267,7 +438,10 @@ def _infllmv2_attn_varlen_backward(
 
 
 if torch.__version__ >= "2.4.0":
-    _wrapped_infllmv2_attn_varlen_backward = torch.ops.infllmv2_attn._infllmv2_attn_varlen_backward
+    try:
+        _wrapped_infllmv2_attn_varlen_backward = torch.ops.infllmv2_attn._infllmv2_attn_varlen_backward
+    except Exception:
+        _wrapped_infllmv2_attn_varlen_backward = _infllmv2_attn_varlen_backward
 else:
     _wrapped_infllmv2_attn_varlen_backward = _infllmv2_attn_varlen_backward
 
@@ -459,6 +633,30 @@ def infllmv2_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if infllm_cuda is None or (not q.is_cuda):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, softmax_lse, s_dmask, _, _ = _infllmv2_attn_varlen_forward_torch(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_attn_probs,
+            block_table=block_table,
+            topk_idx=topk_idx,
+        )
+        return out if not return_attn_probs else (out, softmax_lse, s_dmask)
+
     return Infllmv2AttnVarlenFunc.apply(
         q,
         k,
@@ -552,6 +750,17 @@ def infllmv2_attn_stage1(
     # batch_size = cu_seqlens_q.numel() - 1
     nheads_k = k.shape[1]
     nheads_per_group = nheads // nheads_k
+
+    if infllm_cuda is None or (not q.is_cuda):
+        return _infllmv2_attn_stage1_torch(
+            q,
+            k,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+        )
     
     # Reshape query for NSA pattern
     # From (total_q, nsa_group_size * nsa_heads_per_group, head_dim)

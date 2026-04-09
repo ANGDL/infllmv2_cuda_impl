@@ -15,6 +15,12 @@ from infllm_v2 import (
     uint64_to_bool,
 )
 from infllm_v2._cuda_ext import C
+from infllm_v2.infllmv2_sparse_attention import (
+    _infllmv2_attn_stage1_torch,
+    _infllmv2_attn_varlen_forward_torch,
+    infllmv2_attn_stage1,
+    infllmv2_attn_varlen_func,
+)
 from infllm_v2.torch_kernels import (
     blockmask_to_uint64_torch,
     max_pooling_1d_torch,
@@ -313,3 +319,142 @@ def test_max_pooling_1d_varlen_v2_cuda_vs_torch_accuracy_and_perf():
         stride=16,
     ))
     print(f"\nmax_pooling_1d_varlen_v2 cuda={t_cuda_v2*1e3:.3f}ms torch={t_torch_v2*1e3:.3f}ms")
+
+
+def test_varlen_fwd_cuda_vs_torch_accuracy_and_perf():
+    device = "cuda"
+    torch.manual_seed(0)
+
+    total_q, total_k = 320, 256
+    nheads_q, nheads_k, headdim = 8, 2, 64
+    q = torch.randn(total_q, nheads_q, headdim, device=device, dtype=torch.float16)
+    k = torch.randn(total_k, nheads_k, headdim, device=device, dtype=torch.float16)
+    v = torch.randn(total_k, nheads_k, headdim, device=device, dtype=torch.float16)
+    cu_q = torch.tensor([0, 128, 320], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, 96, 256], device=device, dtype=torch.int32)
+
+    out_cuda = infllmv2_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=192,
+        max_seqlen_k=160,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
+        return_attn_probs=False,
+    )
+    out_torch, _, _, _, _ = _infllmv2_attn_varlen_forward_torch(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=192,
+        max_seqlen_k=160,
+        dropout_p=0.0,
+        softmax_scale=q.shape[-1] ** (-0.5),
+        causal=True,
+        return_softmax=False,
+    )
+
+    assert torch.allclose(out_cuda, out_torch, atol=2e-2, rtol=2e-2)
+
+    t_cuda = _bench_cuda(
+        lambda: infllmv2_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q=192,
+            max_seqlen_k=160,
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=True,
+            return_attn_probs=False,
+        )
+    )
+    t_torch = _bench_cuda(
+        lambda: _infllmv2_attn_varlen_forward_torch(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q=192,
+            max_seqlen_k=160,
+            dropout_p=0.0,
+            softmax_scale=q.shape[-1] ** (-0.5),
+            causal=True,
+            return_softmax=False,
+        )[0]
+    )
+    print(f"\nvarlen_fwd cuda={t_cuda*1e3:.3f}ms torch={t_torch*1e3:.3f}ms")
+
+
+def test_varlen_fwd_stage1_cuda_vs_torch_accuracy_and_perf():
+    device = "cuda"
+    torch.manual_seed(1)
+
+    total_q, total_k = 384, 288
+    nheads_q, nheads_k, headdim = 8, 2, 64
+    q = torch.randn(total_q, nheads_q, headdim, device=device, dtype=torch.float16)
+    k = torch.randn(total_k, nheads_k, headdim, device=device, dtype=torch.float16)
+    v = torch.randn(total_k, nheads_k, headdim, device=device, dtype=torch.float16)
+    cu_q = torch.tensor([0, 160, 384], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, 112, 288], device=device, dtype=torch.int32)
+    max_seqlen_k = 192
+
+    out_cuda = infllmv2_attn_stage1(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        cu_seqlens_v=cu_k,
+        max_seqlen_q=224,
+        max_seqlen_k=max_seqlen_k,
+        dropout_p=0.0,
+        causal=True,
+    )
+    out_torch = _infllmv2_attn_stage1_torch(
+        q,
+        k,
+        cu_q,
+        cu_k,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=q.shape[-1] ** (-0.5),
+        causal=True,
+    )
+
+    assert torch.allclose(out_cuda[:, :total_q, :max_seqlen_k], out_torch[:, :total_q, :max_seqlen_k], atol=2e-2, rtol=2e-2)
+
+    t_cuda = _bench_cuda(
+        lambda: infllmv2_attn_stage1(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            cu_seqlens_v=cu_k,
+            max_seqlen_q=224,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=0.0,
+            causal=True,
+        )
+    )
+    t_torch = _bench_cuda(
+        lambda: _infllmv2_attn_stage1_torch(
+            q,
+            k,
+            cu_q,
+            cu_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=q.shape[-1] ** (-0.5),
+            causal=True,
+        )
+    )
+    print(f"\nvarlen_fwd_stage1 cuda={t_cuda*1e3:.3f}ms torch={t_torch*1e3:.3f}ms")
